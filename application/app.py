@@ -1,0 +1,1080 @@
+# -*- coding: utf-8 -*-
+"""
+集装箱装箱计算 · 网页版 (Streamlit + Plotly)
+================================================================
+运行方式：
+    pip install -r requirements.txt
+    streamlit run app.py
+浏览器会自动打开一个本地网址(默认 http://localhost:8501)。
+
+功能：
+  · 上传数据(txt/xlsx)或直接粘贴，设置重量阈值，选择 标准版/增强版
+  · 交互式 3D 装箱结果(可旋转/缩放/悬停/按类别显示隐藏)
+  · 导出 Excel 装箱清单 与 JSON 方案
+================================================================
+"""
+import io
+import plotly.graph_objects as go
+import streamlit as st
+
+from packer_pro import MM, to_mm, to_int
+from planner_core import (
+    CARGO_TYPES, CONTAINER_PRESETS, SAMPLE_CARGO, SAMPLE_CONTAINER, TYPE_LABELS,
+    _parse_bool, _valid_rows, baseline_note, build_cargo_txt, build_cargo_xlsx,
+    build_dataframe, build_excel_bytes, build_json_bytes, compute_estimate,
+    load_saved_plan, parse_txt, parse_xlsx, rows_to_boxes_ex, run_packing,
+    saved_plan_form_data,
+)
+
+
+# --------------------------------------------------------------------------- #
+#                       表格 <-> 内部数据 互转                                 #
+# --------------------------------------------------------------------------- #
+
+
+def _new_row(l=0.0, w=0.0, h=0.0, n=1, wt=0.0, type='木箱', no_flip=False, prio=0, desc=''):
+    """新建一行货物，分配全局唯一 id（避免删除后控件状态错位）。
+
+    no_flip: 是否禁止倒放（落地面固定长×宽，高只能是原始高度）。
+    prio:    手动模式下的摆放优先级（越大越优先放底层）。
+    desc:    零件描述 / 品名，仅用于区分货物与导出展示。
+    """
+    rid = st.session_state.get('next_id', 0)
+    st.session_state.next_id = rid + 1
+    return {'id': rid, 'l': float(l), 'w': float(w), 'h': float(h),
+            'n': int(n), 'wt': float(wt), 'type': type,
+            'no_flip': _parse_bool(no_flip, False), 'prio': int(prio), 'desc': str(desc)}
+
+
+def sample_rows():
+    return [_new_row(*d) for d in SAMPLE_CARGO]
+
+
+def boxes_to_rows(boxes, descriptions=None, no_flip=None, priority=None):
+    descriptions = descriptions or []
+    no_flip = no_flip or []
+    priority = priority or []
+    rows = []
+    for i, (l, w, h, n, weight, t) in enumerate(boxes):
+        d = descriptions[i] if i < len(descriptions) else ''
+        nf = _parse_bool(no_flip[i], False) if i < len(no_flip) else False
+        prio = to_int(priority[i]) if i < len(priority) else 0
+        rows.append(_new_row(l / MM, w / MM, h / MM, n, weight,
+                             TYPE_LABELS.get(str(t), str(t)), no_flip=nf,
+                             prio=prio, desc=d))
+    return rows
+
+
+def install_imported_rows(boxes, descriptions=None, no_flip=None, priority=None):
+    """把文件内容安装到会话，并同步带 key 的复选框/优先级控件状态。"""
+    imported_rows = boxes_to_rows(boxes, descriptions, no_flip, priority)
+    for row in imported_rows:
+        st.session_state[f"nf_{row['id']}"] = row['no_flip']
+        st.session_state[f"prio_{row['id']}"] = row['prio']
+    st.session_state.rows = imported_rows
+    return imported_rows
+
+
+# --------------------------------------------------------------------------- #
+#                           交互式 3D (Plotly)                                 #
+# --------------------------------------------------------------------------- #
+_TAB10 = ['#3151CB', '#B9693F', '#2F7D68', '#A84A5B', '#6B5CA5',
+          '#8A6A4A', '#4F7897', '#69727D', '#8C7836', '#2F7480']
+
+# 立方体的 12 个三角面（顶点索引），顶点顺序见 _cuboid_vertices
+_TRI_I = [0, 0, 0, 0, 4, 4, 0, 0, 1, 1, 2, 2]
+_TRI_J = [1, 2, 1, 4, 5, 6, 3, 4, 5, 2, 6, 3]
+_TRI_K = [2, 3, 5, 5, 6, 7, 7, 7, 6, 6, 7, 7]
+
+
+def _cuboid_vertices(x, y, z, dx, dy, dz):
+    return [(x, y, z), (x + dx, y, z), (x + dx, y + dy, z), (x, y + dy, z),
+            (x, y, z + dz), (x + dx, y, z + dz), (x + dx, y + dy, z + dz), (x, y + dy, z + dz)]
+
+
+def build_figure(packer, highlight_categories=None, region=None,
+                 translucent=False, show_edges=True):
+    """构建交互式 3D 图：每类一个网格，可在图例中点选显示/隐藏。
+
+    region 非空时为 (x0, x1, y0, y1, z0, z1)（单位 mm），只绘制"起点"落在该范围内的
+    箱子，用于沿装货方向（长/宽）或高度分段查看装载过程。
+    """
+    if highlight_categories is None:
+        highlight_categories = {info['input_order'] + 1 for info in packer.box_colors}
+
+    fig = go.Figure()
+
+    # 集装箱线框
+    L, W, H = [c / MM for c in packer.container]
+    edges = [((0, 0, 0), (L, 0, 0)), ((0, W, 0), (L, W, 0)), ((0, 0, H), (L, 0, H)), ((0, W, H), (L, W, H)),
+             ((0, 0, 0), (0, W, 0)), ((L, 0, 0), (L, W, 0)), ((0, 0, H), (0, W, H)), ((L, 0, H), (L, W, H)),
+             ((0, 0, 0), (0, 0, H)), ((L, 0, 0), (L, 0, H)), ((0, W, 0), (0, W, H)), ((L, W, 0), (L, W, H))]
+    ex, ey, ez = [], [], []
+    for a, b in edges:
+        ex += [a[0], b[0], None]
+        ey += [a[1], b[1], None]
+        ez += [a[2], b[2], None]
+    fig.add_trace(go.Scatter3d(x=ex, y=ey, z=ez, mode='lines',
+                               line=dict(color='#263142', width=3), name='集装箱', hoverinfo='skip'))
+
+    # 按类别分组
+    cats = {}
+    for (x, y, z, l, w, h), info in zip(packer.packing_plan, packer.box_colors):
+        cats.setdefault(info['input_order'], []).append(((x, y, z, l, w, h), info))
+
+    # 箱体边框线（所有类别共用一条 Scatter3d，避免上千个 trace 拖慢渲染）
+    edge_x, edge_y, edge_z = [], [], []
+    _EDGES = ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+              (0, 4), (1, 5), (2, 6), (3, 7))
+    drawn = 0
+
+    for io in sorted(cats):
+        category = io + 1
+        selected = category in highlight_categories
+        color = _TAB10[io % len(_TAB10)] if selected else '#D8D9D5'
+        # 实体不透明：Plotly 的 Mesh3d 在半透明时没有正确深度排序，会糊成一片
+        opacity = (0.42 if translucent else 1.0) if selected else 0.08
+        vx, vy, vz, ii, jj, kk, htext = [], [], [], [], [], [], []
+        base = 0
+        for (x, y, z, l, w, h), info in cats[io]:
+            if region is not None:
+                x0, x1, y0, y1, z0, z1 = region
+                if not (x0 <= x <= x1 and y0 <= y <= y1 and z0 <= z <= z1):
+                    continue  # 分段查看：起点不在所选范围内的箱子暂不显示
+            verts = _cuboid_vertices(x / MM, y / MM, z / MM, l / MM, w / MM, h / MM)
+            for (vX, vY, vZ) in verts:
+                vx.append(vX); vy.append(vY); vz.append(vZ)
+            if selected:
+                drawn += 1
+                for a, b in _EDGES:  # 逐箱描边，相邻同色货物才能区分开
+                    edge_x += [verts[a][0], verts[b][0], None]
+                    edge_y += [verts[a][1], verts[b][1], None]
+                    edge_z += [verts[a][2], verts[b][2], None]
+            ii += [base + t for t in _TRI_I]
+            jj += [base + t for t in _TRI_J]
+            kk += [base + t for t in _TRI_K]
+            dl, dw, dh = info['original_dimensions']
+            tlabel = TYPE_LABELS.get(str(info['type']), str(info['type']))
+            _desc = info.get('desc', '')
+            _desc_line = f"{_desc}<br>" if _desc else ''
+            htext.append(f"箱号 {info['number']}｜类别 {category}｜{tlabel}<br>"
+                         f"{_desc_line}尺寸 {dl:g}×{dw:g}×{dh:g} m｜重量 {info['weight']:g} kg")
+            base += 8
+        if not vx:
+            continue  # 该类别在当前层高下无可显示的箱子
+        # 图例数量取本方案实际装入的件数；未全部装入时附上应装总数，避免与清单数量混淆
+        placed = len(cats[io])
+        total = packer.boxes[io][3]
+        qty_label = f"已装{placed}件" if placed >= total else f"已装{placed}/{total}件"
+        dl, dw, dh = cats[io][0][1]['original_dimensions']
+        tlabel = TYPE_LABELS.get(str(cats[io][0][1]['type']), str(cats[io][0][1]['type']))
+        desc = str(cats[io][0][1].get('desc', '')).strip()
+        # 图例优先显示零件描述，没有描述才回退到「类别N」
+        lead = desc if desc else f"类别{category}"
+        fig.add_trace(go.Mesh3d(
+            x=vx, y=vy, z=vz, i=ii, j=jj, k=kk,
+            color=color, opacity=opacity, flatshading=True,
+            lighting=dict(ambient=0.62, diffuse=0.88, specular=0.12,
+                          roughness=0.55, fresnel=0.1),
+            lightposition=dict(x=1000, y=-1200, z=2000),
+            name=f"{lead}: {dl:g}×{dw:g}×{dh:g}m ({tlabel}, {qty_label})",
+            showlegend=True, hoverinfo='text',
+            hovertext=[t for t in htext for _ in range(8)],
+        ))
+
+    # 边框线：箱数过多时自动省略，避免拖慢浏览器
+    if show_edges and edge_x and drawn <= 2500:
+        fig.add_trace(go.Scatter3d(
+            x=edge_x, y=edge_y, z=edge_z, mode='lines',
+            line=dict(color='rgba(20,27,38,0.52)', width=1),
+            hoverinfo='skip', showlegend=False))
+
+    fig.update_layout(
+        scene=dict(
+            xaxis_title='长 Length (m)', yaxis_title='宽 Width (m)', zaxis_title='高 Height (m)',
+            aspectmode='data',
+            camera=dict(eye=dict(x=1.65, y=-1.55, z=1.0), up=dict(x=0, y=0, z=1)),
+            xaxis=dict(backgroundcolor='#F7F7F4', gridcolor='#D9DAD5', zerolinecolor='#C8CAC4',
+                       tickfont=dict(color='#626A75'), title=dict(font=dict(color='#343B46')), showbackground=True),
+            yaxis=dict(backgroundcolor='#F7F7F4', gridcolor='#D9DAD5', zerolinecolor='#C8CAC4',
+                       tickfont=dict(color='#626A75'), title=dict(font=dict(color='#343B46')), showbackground=True),
+            zaxis=dict(backgroundcolor='#F7F7F4', gridcolor='#D9DAD5', zerolinecolor='#C8CAC4',
+                       tickfont=dict(color='#626A75'), title=dict(font=dict(color='#343B46')), showbackground=True),
+        ),
+        # 图例移到图表下方：顶部让给 Plotly 工具条（缩放/复位/相机/全屏），避免重叠
+        margin=dict(l=0, r=0, t=8, b=0), height=700,
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='Inter, Microsoft YaHei, sans-serif', color='#343B46'),
+        legend=dict(orientation='h', yanchor='top', y=-0.02, xanchor='left', x=0,
+                    bgcolor='rgba(252,252,250,.92)', bordercolor='#DCDDD8', borderwidth=1,
+                    font=dict(size=11, color='#4A515C')),
+    )
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+#                        实时预估 / 预警（即时反馈）                           #
+# --------------------------------------------------------------------------- #
+
+
+def render_live_estimate(container_mm, boxes, threshold):
+    """把实时预估渲染到界面：四个指标 + 体积进度条 + 预警。"""
+    est = compute_estimate(container_mm, boxes, threshold)
+    section_title(IC_GAUGE, '实时预估')
+    m = st.columns(4)
+    m[0].metric('货物件数', f"{est['pieces']}")
+    m[1].metric('货物总体积', f"{est['cargo_vol_m3']:.2f} m³")
+    m[2].metric('体积占集装箱', f"{est['ratio'] * 100:.1f}%")
+    m[3].metric('货物总重', f"{est['weight']:.0f} kg")
+    st.progress(min(est['ratio'], 1.0))
+    if est['over_volume']:
+        st.error(f"⚠ 货物总体积 {est['cargo_vol_m3']:.2f} m³ 已超过集装箱 "
+                 f"{est['cont_vol_m3']:.2f} m³，必然装不下。")
+    if est['oversized_count']:
+        st.warning(f"⚠ 有 {est['oversized_count']} 类货物任意摆放都超过集装箱内尺寸，无法装入。")
+    if est['heavy_count']:
+        st.info(f"ℹ 有 {est['heavy_count']} 类为重货(>{threshold:g}kg)，将优先放到底层"
+                f"（实在放不下时仍允许叠放）。")
+
+
+# --------------------------------------------------------------------------- #
+#                          界面主题（视觉设计）                                #
+# --------------------------------------------------------------------------- #
+THEME_CSS = """
+<style>
+html, body, [class*="css"], .stApp, button, input, textarea, select {
+    font-family: Inter, "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+}
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header[data-testid="stHeader"] {background: transparent;}
+html {background: #F3F3F0;}
+.stApp {background: transparent;}
+.block-container {position: relative; z-index: 1; padding-top: 1.25rem;
+    padding-bottom: 4.5rem; max-width: 1280px;}
+
+/* 工程网格 + 低频环境光场：为长页面提供呼吸感，不干扰内容阅读 */
+.page-grid {position:fixed; inset:0; z-index:0; pointer-events:none; overflow:hidden;
+    background:#F3F3F0; isolation:isolate;}
+.page-grid::before {content:""; position:absolute; inset:0; z-index:3; opacity:.82;
+    background-image:linear-gradient(rgba(15,23,42,.028) 1px,transparent 1px),
+                     linear-gradient(90deg,rgba(15,23,42,.028) 1px,transparent 1px);
+    background-size:32px 32px;
+    mask-image:linear-gradient(to bottom,rgba(0,0,0,.86),rgba(0,0,0,.24) 72%,transparent);}
+.page-grid::after {content:""; position:absolute; inset:-14%; z-index:0;
+    background:
+      radial-gradient(ellipse 56% 44% at 80% 8%,rgba(73,101,214,.18),rgba(73,101,214,.045) 48%,transparent 72%),
+      radial-gradient(ellipse 52% 46% at 12% 48%,rgba(74,154,166,.12),rgba(74,154,166,.03) 50%,transparent 74%),
+      radial-gradient(ellipse 48% 42% at 72% 88%,rgba(128,105,178,.12),rgba(128,105,178,.025) 52%,transparent 76%),
+      linear-gradient(145deg,#F5F5F1 4%,#F1F3F2 48%,#F5F3F5 96%);
+    transform-origin:center; will-change:transform,opacity,filter;
+    animation:canvasBreath 18s cubic-bezier(.45,0,.55,1) infinite;}
+.ambient-halo {position:absolute; z-index:1; border-radius:50%; opacity:.38;
+    will-change:transform,opacity;
+    mix-blend-mode:multiply;}
+.halo-a {width:680px; height:680px; right:-240px; top:-220px;
+    background:radial-gradient(circle,rgba(82,112,232,.24),rgba(82,112,232,.06) 44%,transparent 70%);
+    animation:ambientA 20s ease-in-out infinite;}
+.halo-b {width:760px; height:760px; left:-330px; top:38%;
+    background:radial-gradient(circle,rgba(89,180,193,.15),rgba(89,180,193,.04) 46%,transparent 70%);
+    animation:ambientB 26s ease-in-out infinite;}
+.halo-c {width:600px; height:600px; right:8%; bottom:-310px;
+    background:radial-gradient(circle,rgba(122,96,188,.14),rgba(122,96,188,.035) 48%,transparent 72%);
+    animation:ambientC 23s ease-in-out infinite;}
+.route-field {position:absolute; z-index:2; inset:-3% -8%; width:116%; height:106%; opacity:.34;}
+.route-field .route {fill:none; stroke:#6079D5; stroke-width:1; stroke-opacity:.18;
+    stroke-dasharray:7 16; animation:routeFlow 28s linear infinite;}
+.route-field .route-b {stroke:#518E9C; stroke-opacity:.14; stroke-dasharray:3 20;
+    animation-duration:36s; animation-direction:reverse;}
+.route-field .node {fill:#4968DC; opacity:.2; transform-box:fill-box; transform-origin:center;
+    animation:nodeBreathe 6s ease-in-out infinite;}
+.route-field .node:nth-of-type(2) {animation-delay:-2s;}
+.route-field .node:nth-of-type(3) {animation-delay:-4s;}
+@keyframes ambientA {0%,100%{transform:translate3d(0,0,0) scale(1);opacity:.46}
+    50%{transform:translate3d(-54px,42px,0) scale(1.08);opacity:.68}}
+@keyframes ambientB {0%,100%{transform:translate3d(0,0,0) scale(1)}
+    50%{transform:translate3d(72px,-48px,0) scale(.92)}}
+@keyframes ambientC {0%,100%{transform:translate3d(0,0,0) scale(.95)}
+    50%{transform:translate3d(-42px,-36px,0) scale(1.08)}}
+@keyframes routeFlow {to{stroke-dashoffset:-230px}}
+@keyframes nodeBreathe {0%,100%{opacity:.12;transform:scale(.65)}50%{opacity:.42;transform:scale(1.2)}}
+@keyframes canvasBreath {
+    0%,100%{transform:translate3d(-1.2%,0,0) scale(1);opacity:.76;filter:saturate(.88)}
+    50%{transform:translate3d(1.4%,1%,0) scale(1.045);opacity:1;filter:saturate(1.03)}
+}
+
+/* Hero：深色编辑式封面，不使用高饱和渐变与发光 */
+.hero {
+    display:grid; grid-template-columns:minmax(0,1.15fr) minmax(300px,.85fr); gap:36px;
+    align-items:center; min-height:300px; background:#0C1524;
+    border:1px solid #1E2A3D; border-radius:14px; padding:42px 46px; margin-bottom:24px;
+    box-shadow:0 18px 44px rgba(12,21,36,.14); position:relative; overflow:hidden;
+    animation:heroEnter .55s cubic-bezier(.2,.7,.2,1) both;
+}
+.hero::after {content:""; position:absolute; inset:0; pointer-events:none; opacity:.42;
+    background-image:linear-gradient(rgba(148,163,184,.08) 1px,transparent 1px),
+                     linear-gradient(90deg,rgba(148,163,184,.08) 1px,transparent 1px);
+    background-size:28px 28px; mask-image:linear-gradient(90deg,transparent 35%,#000);}
+.hero::before {content:""; position:absolute; z-index:1; top:0; bottom:0; width:34%;
+    left:48%; opacity:.17; transform:skewX(-12deg) translateX(-180%);
+    background:linear-gradient(90deg,transparent,rgba(104,135,238,.22),transparent);
+    animation:heroScan 10s ease-in-out infinite; pointer-events:none;}
+.hero-copy,.hero-visual {position:relative; z-index:1;}
+.hero-kicker {display:flex; align-items:center; gap:10px; color:#91A4BE; font-size:11px;
+    font-weight:650; letter-spacing:2.2px; text-transform:uppercase; margin-bottom:22px;}
+.hero-kicker::before {content:""; width:22px; height:1px; background:#4B72F2;
+    transform-origin:left; animation:kickerLine 3.8s ease-in-out infinite;}
+.hero-title {color:#F8FAFC; font-size:clamp(32px,4vw,48px) !important; line-height:1.12;
+    font-weight:620; margin:0; letter-spacing:-1.6px;}
+.hero-title span {color:#87A2FF;}
+.hero-sub {color:#AAB7C9; font-size:14px; line-height:1.8; max-width:580px; margin:18px 0 0;}
+.hero-meta {display:flex; gap:0; margin-top:28px; border-top:1px solid #27354A; padding-top:18px;}
+.hero-meta-item {padding:0 22px; border-right:1px solid #27354A; color:#7E8DA2;
+    font-size:10px; letter-spacing:1.05px; line-height:1.35;}
+.hero-meta-item:first-child {padding-left:0;}
+.hero-meta-item:last-child {border-right:0;}
+.hero-meta-item strong {display:block; color:#E7ECF4; font-size:15px; font-weight:580;
+    letter-spacing:.05px; margin-bottom:4px;}
+.hero-visual {min-height:218px; display:flex; align-items:center; justify-content:center;}
+.hero-visual svg {width:100%; max-width:420px; height:auto;
+    animation:blueprintFloat 7s ease-in-out infinite;}
+.hero-flow {position:absolute; left:7%; right:3%; bottom:0; display:flex; align-items:center;
+    justify-content:center; color:#8595AB; font-size:9px; font-weight:620;
+    letter-spacing:1.15px; text-transform:uppercase; white-space:nowrap;}
+.hero-flow i {height:1px; flex:1; max-width:48px; margin:0 9px; position:relative;
+    background:linear-gradient(90deg,#34465F,#5F7CE0);}
+.hero-flow i::after {content:""; position:absolute; width:4px; height:4px; right:0; top:-1.5px;
+    border-radius:50%; background:#7892EB; box-shadow:0 0 9px rgba(120,146,235,.65);
+    animation:flowNode 3.6s ease-in-out infinite;}
+@keyframes heroEnter {from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@keyframes kickerLine {0%,100%{transform:scaleX(.55);opacity:.55}50%{transform:scaleX(1);opacity:1}}
+@keyframes blueprintFloat {0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
+@keyframes heroScan {0%,18%{transform:skewX(-12deg) translateX(-180%)}
+    62%,100%{transform:skewX(-12deg) translateX(245%)}}
+@keyframes flowNode {0%,100%{opacity:.35;transform:scale(.7)}50%{opacity:1;transform:scale(1.25)}}
+
+/* 卡片容器 */
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    background:#FCFCFA; border:1px solid #DCDDD8 !important; border-radius:12px;
+    box-shadow:0 1px 2px rgba(15,23,42,.025); margin-bottom:16px;
+    animation:cardEnter .38s ease-out both; transition:transform .25s ease,border-color .25s ease,
+    box-shadow .25s ease;
+}
+div[data-testid="stVerticalBlockBorderWrapper"]:hover {transform:translateY(-1px);
+    border-color:#C9D0E4 !important; box-shadow:0 14px 36px rgba(30,43,68,.065);}
+div[data-testid="stVerticalBlockBorderWrapper"] > div {padding:12px 20px 16px;}
+@keyframes cardEnter {from{opacity:.35;transform:translateY(5px)}to{opacity:1;transform:none}}
+
+/* 指标卡 */
+div[data-testid="stMetric"] {
+    background:#F7F7F4; border:1px solid #E2E3DE; border-radius:9px;
+    padding:16px 17px; box-shadow:none;
+}
+div[data-testid="stMetricValue"] {color:#111827; font-weight:570; letter-spacing:-.7px;
+    font-variant-numeric:tabular-nums;}
+div[data-testid="stMetricLabel"] {color:#737A86; font-size:12px; font-weight:520;
+    letter-spacing:.2px;}
+
+/* 按钮 */
+.stButton>button {
+    min-height:40px; border-radius:8px; font-weight:570; border:1px solid #D7D9D5;
+    background:#FCFCFA; color:#242B36; padding:8px 16px; transition:background .15s ease,
+    border-color .15s ease,color .15s ease;
+}
+.stButton>button:hover {border-color:#AAB1BC; color:#111827; background:#F3F4F1;}
+.stButton>button[kind="primary"] {
+    background:#2347D9; border-color:#2347D9; color:#fff; box-shadow:none;
+    position:relative; overflow:hidden;
+}
+.stButton>button[kind="primary"]:hover {background:#1939BD; border-color:#1939BD; color:#fff;}
+.stButton>button[kind="primary"]::after {content:""; position:absolute; inset:-2px auto -2px -34%;
+    width:22%; transform:skewX(-20deg); background:rgba(255,255,255,.16); opacity:0;}
+.stButton>button[kind="primary"]:hover::after {opacity:1; left:112%; transition:left .55s ease,opacity .2s;}
+
+/* 章节标题 */
+h3,h4 {color:#141B26; font-weight:620; letter-spacing:-.25px;}
+.sec-title {display:flex; align-items:center; gap:10px; font-size:17px; font-weight:620;
+    color:#151C27; margin:2px 0 14px; letter-spacing:-.2px;}
+.sec-ic {display:inline-flex; width:29px; height:29px; border-radius:7px;
+    align-items:center; justify-content:center; color:#3151CB; background:#EEF1FC;
+    border:1px solid #DCE3FA; box-shadow:none;}
+.sec-ic svg {width:16px; height:16px;}
+.grid-head {font-size:11px; font-weight:650; color:#7A818C; padding:2px 4px 7px;
+    letter-spacing:.65px; text-transform:uppercase;}
+
+/* 侧边栏 */
+section[data-testid="stSidebar"] {background:#F8F8F5; border-right:1px solid #DCDDD8;}
+section[data-testid="stSidebar"] > div {padding-top:1.15rem;}
+section[data-testid="stSidebar"] hr {border-color:#E1E2DD;}
+
+/* 表单与数据控件 */
+div[data-baseweb="input"] > div, div[data-baseweb="select"] > div,
+div[data-baseweb="textarea"] > div {background:#FCFCFA !important; border-color:#D7D9D5 !important;
+    border-radius:8px !important; box-shadow:none !important;}
+div[data-baseweb="input"] > div:focus-within, div[data-baseweb="select"] > div:focus-within,
+div[data-baseweb="textarea"] > div:focus-within {border-color:#5571DF !important;
+    box-shadow:0 0 0 2px rgba(35,71,217,.08) !important;}
+div[data-testid="stFileUploaderDropzone"] {background:#F7F7F4; border:1px dashed #C8CBC5;
+    border-radius:9px;}
+div[data-testid="stDataFrame"] {border:1px solid #DCDDD8; border-radius:9px; overflow:hidden;}
+details[data-testid="stExpander"] {background:#FCFCFA; border:1px solid #DCDDD8 !important;
+    border-radius:9px !important;}
+div[data-testid="stProgress"] > div > div > div {background:#3151CB;}
+div[role="radiogroup"] label, label[data-baseweb="checkbox"] {color:#343B46;}
+label[data-testid="stRadioOption"][data-selected="true"] > div > div > div:first-child {
+    background:#3151CB !important;}
+
+/* 提示条 */
+div[data-testid="stAlert"] {border-radius:8px; border-width:1px; box-shadow:none;}
+
+/* 下载按钮与链接按钮保持克制 */
+.stDownloadButton>button {border-radius:8px; min-height:40px; border:1px solid #D7D9D5;
+    background:#FCFCFA; color:#242B36; font-weight:570;}
+.stDownloadButton>button:hover {border-color:#3151CB; color:#2347D9; background:#F6F7FC;}
+
+/* 主按钮的矢量图标（闪电=开始计算），替代 emoji */
+.stButton>button[kind="primary"]::before {
+    content: ""; display: inline-block; width: 17px; height: 17px;
+    margin-right: 9px; vertical-align: -3px;
+    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13 2 4 14h7l-1 8 9-12h-7z'/%3E%3C/svg%3E") no-repeat center/contain;
+}
+
+/* 计算中的动画：节制的装载节拍 */
+.calc-loader {display: flex; flex-direction: column; align-items: center; gap: 16px;
+    padding: 34px 0 28px 0;}
+.cubes {display: flex; gap: 11px; align-items: flex-end; height: 46px;}
+.cube {width: 20px; border-radius: 3px; background:#3151CB; box-shadow:none;
+    animation: stack 1.15s ease-in-out infinite;}
+.cube:nth-child(1) {height: 20px; animation-delay: 0s;}
+.cube:nth-child(2) {height: 30px; animation-delay: .13s;}
+.cube:nth-child(3) {height: 40px; animation-delay: .26s;}
+.cube:nth-child(4) {height: 30px; animation-delay: .39s;}
+.cube:nth-child(5) {height: 20px; animation-delay: .52s;}
+@keyframes stack {
+    0%, 100% {transform: translateY(0) scaleY(1); opacity: .55;}
+    50% {transform: translateY(-13px) scaleY(1.12); opacity: 1;}
+}
+.calc-text {font-weight:600; font-size:15px; letter-spacing:.25px; color:#202733;}
+.calc-sub {font-size:12px; color:#7A818C;}
+
+/* 页脚 */
+.site-footer {margin:42px 0 4px; border-top:1px solid #DCDDD8; padding-top:20px;}
+.footer-inner {display:flex; align-items:center; justify-content:space-between; gap:14px;}
+.footer-txt {line-height: 1.4;}
+.footer-name {font-weight:620; font-size:13px; color:#202733; letter-spacing:.1px;}
+.footer-sub {font-size:10px; color:#888E97; letter-spacing:1.05px; text-transform:uppercase;}
+.sig-mark {font-weight:650; font-size:12px; letter-spacing:1.6px; color:#263248;
+    width:42px; height:42px; border-radius:8px; display:flex; align-items:center;
+    justify-content:center; background:#E9EBE7; border:1px solid #D5D7D2; box-shadow:none;}
+.footer-version {font-size:10px; color:#9A9FA7; letter-spacing:1px; text-transform:uppercase;}
+
+@media (max-width: 860px) {
+    .block-container {padding-top:.75rem;}
+    .hero {grid-template-columns:1fr; padding:32px 28px; gap:20px;}
+    .hero-visual {min-height:170px;}
+    .hero-meta-item {padding:0 13px;}
+}
+@media (max-width: 560px) {
+    .hero {padding:27px 21px; border-radius:11px;}
+    .hero-title {font-size:32px !important; letter-spacing:-1px;}
+    .hero-meta {gap:0;}
+    .hero-meta-item {width:33.333%; border-right:1px solid #27354A; padding:0 8px;}
+    .hero-meta-item:first-child {padding-left:0;}
+    .hero-meta-item:last-child {border-right:0;}
+    .hero-meta-item strong {font-size:13px;}
+    .hero-meta-item {font-size:8px; letter-spacing:.5px;}
+    .hero-flow {font-size:8px; letter-spacing:.7px;}
+    .hero-flow i {margin:0 5px;}
+    .footer-inner {align-items:flex-start;}
+}
+</style>
+"""
+
+FOOTER_HTML = """
+<div class="site-footer">
+  <div class="footer-inner">
+    <div style="display:flex;align-items:center;gap:12px">
+      <span class="sig-mark">本地</span>
+      <div class="footer-txt">
+        <div class="footer-name">集装箱装箱工作台</div>
+        <div class="footer-sub">本地运行 · 集装箱与贸易单据</div>
+      </div>
+    </div>
+    <div class="footer-version">Constraint-aware · Geometry verified</div>
+  </div>
+</div>
+"""
+
+LOADING_HTML = """
+<div class="calc-loader">
+  <div class="cubes">
+    <div class="cube"></div><div class="cube"></div><div class="cube"></div>
+    <div class="cube"></div><div class="cube"></div>
+  </div>
+  <div class="calc-text">正在计算最优装箱方案…</div>
+  <div class="calc-sub">正在尝试多种装载策略与货物朝向，请稍候</div>
+</div>
+"""
+
+HERO_HTML = """
+<div class="hero">
+  <div class="hero-copy">
+    <div class="hero-kicker">LOCAL BUSINESS WORKSPACE</div>
+    <h1 class="hero-title">让每一立方米，<br><span>都有明确去处。</span></h1>
+    <p class="hero-sub">面向真实装柜约束的三维装箱系统。以整数几何内核校验边界、碰撞与支撑，
+    结合混合启发式搜索生成可执行、可复核、可导出的装载方案。</p>
+    <div class="hero-meta">
+      <div class="hero-meta-item"><strong>智能排样</strong>多策略探索</div>
+      <div class="hero-meta-item"><strong>三维复核</strong>空间关系可视</div>
+      <div class="hero-meta-item"><strong>方案交付</strong>导入导出衔接</div>
+    </div>
+  </div>
+  <div class="hero-visual">
+    <svg viewBox="0 0 500 300" fill="none" aria-hidden="true">
+      <path d="M56 82 276 28l164 74-222 58L56 82Z" stroke="#5F7190" stroke-width="1.2"/>
+      <path d="M56 82v126l162 70V160M218 160v118l222-62V102" stroke="#5F7190" stroke-width="1.2"/>
+      <path d="m79 112 126 54v82L79 194v-82Z" fill="#1B2A42" stroke="#4567D8"/>
+      <path d="m216 168 76-20v83l-76 20v-83Z" fill="#2347D9" fill-opacity=".7" stroke="#6E87E8"/>
+      <path d="m298 146 70-18v82l-70 19v-83Z" fill="#18263C" stroke="#63738C"/>
+      <path d="m373 126 47-12v82l-47 13v-83Z" fill="#21304A" stroke="#63738C"/>
+      <path d="m80 107 126-31 86 36-128 33-84-38Z" fill="#22314B" stroke="#63738C"/>
+      <path d="m211 75 67-16 87 37-68 17-86-38Z" fill="#3151CB" fill-opacity=".65" stroke="#7890E7"/>
+      <path d="m283 58 55-13 87 37-56 14-86-38Z" fill="#1A2940" stroke="#63738C"/>
+      <path d="M56 228h384" stroke="#324158" stroke-dasharray="4 5"/>
+      <path d="M56 238h384" stroke="#253348" stroke-dasharray="2 7"/>
+    </svg>
+    <div class="hero-flow"><span>cargo list</span><i></i><span>smart planning</span><i></i><span>loading plan</span></div>
+  </div>
+</div>
+"""
+
+BACKDROP_HTML = """
+<div class="page-grid" aria-hidden="true">
+  <div class="ambient-halo halo-a"></div>
+  <div class="ambient-halo halo-b"></div>
+  <div class="ambient-halo halo-c"></div>
+  <svg class="route-field" viewBox="0 0 1600 1200" preserveAspectRatio="none">
+    <path class="route" d="M-80 210C270 70 430 360 760 224S1260 88 1680 242"/>
+    <path class="route route-b" d="M-120 880C260 680 510 980 860 790s540-92 860 12"/>
+    <circle class="node" cx="410" cy="268" r="4"/>
+    <circle class="node" cx="1010" cy="170" r="4"/>
+    <circle class="node" cx="1180" cy="710" r="4"/>
+  </svg>
+</div>
+"""
+
+# 章节图标（内联 SVG，精致线性图标，替代简陋 emoji）
+IC_BOX = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+          'stroke-linejoin="round"><path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="M3 7l9 5 9-5"/>'
+          '<path d="M12 12v10"/></svg>')
+IC_LIST = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+           'stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1.1"/>'
+           '<circle cx="3.5" cy="12" r="1.1"/><circle cx="3.5" cy="18" r="1.1"/></svg>')
+IC_GAUGE = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round"><path d="M4 14a8 8 0 0 1 16 0"/><path d="M12 14l3.5-2.5"/></svg>')
+IC_CHART = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V4M4 20h16"/>'
+            '<rect x="7" y="11" width="3" height="6" rx="1"/><rect x="13" y="7" width="3" height="10" rx="1"/></svg>')
+IC_CUBE = IC_BOX
+
+
+def inject_theme():
+    st.markdown(THEME_CSS, unsafe_allow_html=True)
+    st.markdown(BACKDROP_HTML, unsafe_allow_html=True)
+
+
+def render_footer():
+    """页脚签名：随内容排布，不会被 Streamlit 悬浮控件遮挡。"""
+    st.markdown(FOOTER_HTML, unsafe_allow_html=True)
+
+
+def render_hero():
+    st.markdown(HERO_HTML, unsafe_allow_html=True)
+
+
+def section_title(icon_svg, text):
+    st.markdown(f'<div class="sec-title"><span class="sec-ic">{icon_svg}</span><span>{text}</span></div>',
+                unsafe_allow_html=True)
+
+
+def render_guide():
+    """使用说明：这是什么 + 怎么用。默认收起，不干扰熟练用户。"""
+    with st.expander('使用说明 —— 这是什么、怎么用（首次使用请先看这里）',
+                     expanded=False, icon=':material/menu_book:'):
+        st.markdown("""
+#### 这是什么
+一个**集装箱三维装箱计算工具**。你告诉它集装箱的尺寸和要装的货物（尺寸、数量、重量、类型），
+它会自动算出**每一件货放在哪里、怎么摆**，优先装入尽可能多的件数，再提高空间利用率，并给出三维图和可下载的装箱清单。
+
+计算时会自动遵守这些实际装载规则：
+- **底层优先（软规则）**：可选择让「重的」或「体积重(密度)大的」货物**优先放到底层**；这是偏好而非硬性限制，实在放不下时仍允许叠放，更贴近真实装柜。
+- **禁止倒放（硬规则）**：在货物清单里勾选「禁止倒放」的货物，落地面固定为**长×宽**、高度只能是原始高度（避免运输中零件散开）。
+- **支撑规则**：任何不落地的货物，**底面中心正下方必须有货物托住**（重心有支撑），不会悬空或倾倒；横跨两件货物摆放也可以。
+- **两种工作模式**（左侧栏切换）：**自动模式**由程序按所选指标自动决定底层优先；**手动模式**由你为每类货物手动设定「优先级」，优先级高的放底层。
+
+---
+
+#### 怎么用（5 步）
+
+1. **填集装箱尺寸**：在「集装箱尺寸」填长、宽、高（单位：米）。常见 20 尺柜内径约 `5.9 × 2.35 × 2.39`。
+2. **填货物清单**：在表格里逐行填 长/宽/高/数量/重量，类型用下拉选**木箱 / 纸箱 / 托盘**。
+   - 每行最右侧 🗑 可删除该行；下方有 **添加一行 / 清空清单 / 载入示例**。
+   - 也可展开「**从文件 / 文本导入**」，上传旧的 txt/xlsx 或粘贴文本批量导入。
+   - **录一半要走？** 展开「**导出当前清单**」，选 **txt** 或 **xlsx** 导出到本地；
+     下次再用「**从文件 / 文本导入**」读回来接着填，**不用重新录入**。
+3. **设参数**（左侧栏）：
+   - **工作模式**：**自动模式** / **手动模式**（见上文说明）。
+   - **底层优先指标**（自动模式）：可启用「按重量优先」或「按体积重/密度优先」二选一；密度大的货物更耐压，适合放底层。两项都不启用时先最大化空间利用率，同体积下再比较装入件数。
+   - **优先级**（手动模式）：在货物清单里给每类货物填数字，越大越靠底层。
+   - **重货预警阈值(kg)**：仅用于「实时预估」里的重货提示，不再作为硬性叠放限制。
+   - **计算模式**：**标准版**快速稳定；**增强版**把同类货物拼成整齐的块，用束搜索同时比较多种摆法，时间越长通常越紧密（可设搜索时间上限，默认 600 秒，全部装入会提前结束）。
+4. **点「开始计算」**，等待结果。
+5. **看结果 & 导出**：查看装载率、三维图与清单，底部可下载 **Excel 装箱清单** 与 **JSON 方案**。
+
+---
+
+#### 结果怎么看
+- **实时预估**：还没点计算时就会显示件数、总体积、占集装箱比例、总重，并预警「体积超箱 / 单件超尺寸 / 重货只能放底层」。
+- **三维图**：可用鼠标**旋转、缩放**；悬停可看单件详情。
+- **类别按钮**：点「类别1·纸箱」这类按钮可切换高亮（蓝色=显示中），也可用「全选 / 全不选」。
+- **分段查看**：长/宽/高三个方向各有一个**两端滑块**，可圈定只显示某一段货物。
+  实际装柜是沿**长度方向**从一端装到另一端，所以拖动「长度方向」的左端或右端，
+  就能模拟**从前往后**或**从后往前**的装载过程；「重置显示范围」一键还原。
+- **导出**：Excel 含三页——装箱清单（每件货的原始规格、摆放朝向、落位坐标）、分类汇总、总览。
+
+---
+
+#### 常见问题
+- **货物太多，一次录不完？** 随时展开「导出当前清单」存成 txt 或 xlsx，下次导入即可接着录，进度不丢。
+  导出的文件带中文注释但**可以原样再导入**，也能用记事本/Excel 直接编辑。
+- **想回看以前算过的方案？** 左侧「查看已保存方案」上传之前下载的 `packing_plan.json` 或 `packing_plan.xlsx`，点「载入方案查看」即可重现，无需重算。
+- **提示装不下怎么办？** 程序会优先提高已装体积，并告诉你装了多少、利用率多少。可尝试：改用增强版、增加搜索时间、加大集装箱尺寸或减少货量。
+- **长宽填反了有影响吗？** 没有。程序会自动尝试两种朝向并取更优结果。
+""")
+
+
+# --------------------------------------------------------------------------- #
+#                       货物清单（可逐行删除的表格）                           #
+# --------------------------------------------------------------------------- #
+def _delete_row(rid):
+    st.session_state.rows = [r for r in st.session_state.rows if r['id'] != rid]
+
+
+@st.dialog('删除确认')
+def _confirm_delete(rid):
+    st.write('确定要删除这一行货物吗？删除后不可恢复。')
+    skip = st.checkbox('本次使用不再提示删除确认')
+    c1, c2 = st.columns(2)
+    if c1.button('确认删除', type='primary', use_container_width=True):
+        _delete_row(rid)
+        if skip:
+            st.session_state.skip_del_confirm = True
+        st.rerun()
+    if c2.button('取消', use_container_width=True):
+        st.rerun()
+
+
+def render_cargo_editor(show_priority=False):
+    """自定义货物表格：每行可就地编辑，最右侧 🗑 删除该行（含确认与"不再提示"）。
+
+    show_priority=True 时（手动模式）额外显示「优先级」列，数值越大越优先放底层。
+    「禁止倒放」列两种模式都显示（勾选=落地面固定长×宽，高只能是原始高度）。
+    """
+    labels = ['零件描述 / 品名', '长(m)', '宽(m)', '高(m)', '数量', '重量(kg)', '类型', '禁止倒放']
+    widths = [1.9, 0.9, 0.9, 0.9, 0.7, 0.95, 0.9, 0.8]
+    if show_priority:
+        labels.append('优先级')
+        widths.append(0.7)
+    labels.append('操作')
+    widths.append(0.55)
+    head = st.columns(widths)
+    for col, label in zip(head, labels):
+        col.markdown(f"<div class='grid-head'>{label}</div>", unsafe_allow_html=True)
+    for r in st.session_state.rows:
+        rid = r['id']
+        c = st.columns(widths)
+        r['desc'] = c[0].text_input('desc', value=str(r.get('desc', '')),
+                                    key=f"desc_{rid}", label_visibility='collapsed',
+                                    placeholder='如：电机端盖 M8')
+        r['l'] = c[1].number_input('l', min_value=0.0, value=float(r['l']), step=0.01, format='%.3f',
+                                   key=f"l_{rid}", label_visibility='collapsed')
+        r['w'] = c[2].number_input('w', min_value=0.0, value=float(r['w']), step=0.01, format='%.3f',
+                                   key=f"w_{rid}", label_visibility='collapsed')
+        r['h'] = c[3].number_input('h', min_value=0.0, value=float(r['h']), step=0.01, format='%.3f',
+                                   key=f"h_{rid}", label_visibility='collapsed')
+        r['n'] = c[4].number_input('n', min_value=1, value=int(r['n']), step=1,
+                                   key=f"n_{rid}", label_visibility='collapsed')
+        r['wt'] = c[5].number_input('wt', min_value=0.0, value=float(r['wt']), step=1.0, format='%.1f',
+                                    key=f"wt_{rid}", label_visibility='collapsed')
+        idx = CARGO_TYPES.index(r['type']) if r['type'] in CARGO_TYPES else 0
+        r['type'] = c[6].selectbox('t', CARGO_TYPES, index=idx, key=f"t_{rid}", label_visibility='collapsed')
+        r['no_flip'] = c[7].checkbox('禁止倒放', value=bool(r.get('no_flip', False)),
+                                     key=f"nf_{rid}", label_visibility='collapsed',
+                                     help='勾选后此类货物不可倒放：落地面固定为长×宽，高只能是原始高度')
+        col_i = 8
+        if show_priority:
+            r['prio'] = c[col_i].number_input('prio', value=int(r.get('prio', 0)), step=1,
+                                              key=f"prio_{rid}", label_visibility='collapsed',
+                                              help='数值越大越优先放到底层')
+            col_i += 1
+        if c[col_i].button('🗑', key=f"del_{rid}", help='删除此行', use_container_width=True):
+            if st.session_state.get('skip_del_confirm'):
+                _delete_row(rid)
+                st.rerun()
+            else:
+                _confirm_delete(rid)
+    if not st.session_state.rows:
+        st.caption('清单为空，点击下方「添加一行」或「载入示例」开始录入。')
+
+
+# --------------------------------------------------------------------------- #
+#                               Streamlit UI                                   #
+# --------------------------------------------------------------------------- #
+def _excl_weight():
+    """两个底层优先指标互斥：打开「重量优先」时自动关闭「体积重优先」。"""
+    if st.session_state.get('m_weight'):
+        st.session_state.m_vol = False
+
+
+def _excl_vol():
+    if st.session_state.get('m_vol'):
+        st.session_state.m_weight = False
+
+
+def main():
+    st.set_page_config(
+        page_title='本地业务工作台',
+        page_icon='docs/assets/brand-mark.svg',
+        layout='wide',
+    )
+    inject_theme()
+    render_hero()
+    render_guide()
+
+    # ---- 会话状态初始化（默认给一份示例，便于上手）----
+    st.session_state.setdefault('next_id', 0)
+    if 'rows' not in st.session_state:
+        st.session_state.rows = []  # 默认空清单，用户可手动添加或点“载入示例”
+    for _k in ('cL', 'cW', 'cH'):
+        st.session_state.setdefault(_k, None)  # 默认留空
+    st.session_state.setdefault('ship_no', '')  # 发货单号（整柜一个）
+    # 导入按钮位于 ship_no 输入框之后，不能在同一轮直接修改该 widget key。
+    # 先暂存，下一轮在输入框创建之前应用，避免 StreamlitAPIException。
+    if '_pending_ship_no' in st.session_state:
+        st.session_state.ship_no = st.session_state.pop('_pending_ship_no')
+    # 已保存方案的导入按钮位于尺寸和清单控件之后，不能在点击的同一轮修改
+    # 这些控件。下一轮在任何相关 widget 创建前统一恢复原始输入。
+    if '_pending_plan_form' in st.session_state:
+        pending = st.session_state.pop('_pending_plan_form')
+        container = pending['container']
+        st.session_state.cL = container[0] / MM
+        st.session_state.cW = container[1] / MM
+        st.session_state.cH = container[2] / MM
+        st.session_state.ship_no = pending['ship_no']
+        install_imported_rows(
+            pending['boxes'], pending['descriptions'],
+            pending['no_flip'], pending['priority'])
+
+    # ---- 工作模式切换（自动 / 手动），需在渲染货物清单前确定 ----
+    with st.sidebar:
+        section_title(IC_BOX, '工作模式')
+        page = st.radio('工作模式', ['自动模式', '手动模式'], key='page_mode',
+                        label_visibility='collapsed',
+                        help='自动模式：程序按所选「底层优先指标」自动决定哪类货物放底层。\n'
+                             '手动模式：你为每类货物手动指定摆放优先级，优先级高的放底层。')
+        if page == '自动模式':
+            st.caption('自动模式：程序按所选「底层优先指标」自动摆放。')
+        else:
+            st.caption('手动模式：在货物清单里为每类货物设置「优先级」，数值越大越靠底层。')
+        st.divider()
+    manual = (page == '手动模式')
+
+    with st.container(border=True):
+        section_title(IC_BOX, '集装箱尺寸（米）')
+        # 发货单号（整柜一个，手动输入；导入导出均会带上）
+        st.text_input('发货单号', key='ship_no',
+                      placeholder='选填，例如 SO20260814001')
+        # 常用柜型快速填入（当前选中的柜型高亮蓝底；仍可在下方手动修改尺寸）
+        st.caption('点选常用柜型快速填入（当前选中的柜型高亮蓝底），也可直接在下方手动输入尺寸。')
+        cur = (st.session_state.cL, st.session_state.cW, st.session_state.cH)
+        gc1, gc2, gc3, _ = st.columns([1, 1, 1, 3])
+        for col, name in ((gc1, '20GP'), (gc2, '40GP'), (gc3, '40HQ')):
+            pl = CONTAINER_PRESETS[name]
+            active = cur == pl  # 当前尺寸与该柜型一致 -> 蓝底高亮
+            if col.button(name, use_container_width=True, key=f'gauge_{name}',
+                          type='primary' if active else 'secondary'):
+                st.session_state.cL, st.session_state.cW, st.session_state.cH = pl
+                st.rerun()
+            col.markdown(
+                f"<div style='text-align:center;font-size:11.5px;color:#64748B;margin-top:-6px'>"
+                f"{pl[0]:g}×{pl[1]:g}×{pl[2]:g} m</div>", unsafe_allow_html=True)
+        cc1, cc2, cc3 = st.columns(3)
+        cL = cc1.number_input('长 Length', min_value=0.0, value=st.session_state.cL, step=0.01, format='%.3f')
+        cW = cc2.number_input('宽 Width', min_value=0.0, value=st.session_state.cW, step=0.01, format='%.3f')
+        cH = cc3.number_input('高 Height', min_value=0.0, value=st.session_state.cH, step=0.01, format='%.3f')
+        st.session_state.cL, st.session_state.cW, st.session_state.cH = cL, cW, cH
+    container_mm = (to_mm(cL), to_mm(cW), to_mm(cH))
+
+    with st.container(border=True):
+        section_title(IC_LIST, '货物清单')
+        if manual:
+            st.caption('直接在下表修改数值；勾选「禁止倒放」的货物不会被倒置摆放；'
+                       '「优先级」数值越大越优先放到底层。每行最右侧 🗑 可删除该行（带确认）。')
+        else:
+            st.caption('直接在下表修改数值，类型用下拉选择；勾选「禁止倒放」的货物不会被倒置摆放；'
+                       '每行最右侧 🗑 可删除该行（带确认）。')
+        render_cargo_editor(show_priority=manual)
+        ac1, ac2, ac3 = st.columns(3)
+        if ac1.button('添加一行', icon=':material/add:', use_container_width=True):
+            st.session_state.rows.append(_new_row())
+            st.rerun()
+        if ac2.button('清空清单', icon=':material/delete_sweep:', use_container_width=True):
+            st.session_state.rows = []
+            st.rerun()
+        if ac3.button('载入示例', icon=':material/restart_alt:', use_container_width=True):
+            st.session_state.rows = sample_rows()
+            # 同时填入示例集装箱尺寸，载入后可直接点「开始计算」
+            st.session_state.cL, st.session_state.cW, st.session_state.cH = SAMPLE_CONTAINER
+            st.rerun()
+
+    with st.expander('从文件 / 文本导入（导入后会填入上面的清单供核对）', icon=':material/upload_file:'):
+        if st.session_state.pop('_cargo_import_success', False):
+            st.success('已导入，请在上方核对后点击“开始计算”。')
+        up = st.file_uploader('上传 txt 或 xlsx', type=['txt', 'xlsx'])
+        paste = st.text_area('或粘贴数据文本（第一行集装箱长宽高，第二行种类数，其后每行：长 宽 高 数量 重量 类型）',
+                             height=120)
+        if st.button('导入到清单'):
+            try:
+                c = b = None
+                sn = ''
+                ds = []
+                imported_no_flip = []
+                imported_priority = []
+                if up is not None:
+                    if up.name.endswith('.txt'):
+                        c, b, sn, ds = parse_txt(up.getvalue().decode('utf-8'))
+                    else:
+                        (c, b, sn, ds,
+                         imported_no_flip, imported_priority) = parse_xlsx(io.BytesIO(up.getvalue()))
+                elif paste.strip():
+                    c, b, sn, ds = parse_txt(paste)
+                else:
+                    st.warning('请先上传文件或粘贴文本。')
+                if c:
+                    st.session_state.cL, st.session_state.cW, st.session_state.cH = c[0] / MM, c[1] / MM, c[2] / MM
+                    # Streamlit 对带 key 的控件优先采用 session_state；在下一轮渲染前
+                    # 同步控件键，确保 Excel 中的勾选值立即显示到复选框。
+                    install_imported_rows(
+                        b, ds, imported_no_flip, imported_priority)
+                    st.session_state._pending_ship_no = sn  # 下一轮、widget 创建前回填
+                    st.session_state._cargo_import_success = True
+                    st.rerun()
+            except Exception as e:  # noqa
+                st.error(f'导入失败：{e}')
+
+    with st.expander('导出当前清单（保存录入进度，下次导入即可继续）', icon=':material/download:'):
+        st.caption('导出内容包含集装箱尺寸与全部货物行，可用上方「从文件 / 文本导入」原样读回来继续编辑。')
+        ex1, ex2 = st.columns([1, 1])
+        fmt = ex1.radio('导出格式', ['txt', 'xlsx'], horizontal=True, key='cargo_export_fmt')
+        n_valid = len(_valid_rows(st.session_state.rows))
+        if n_valid == 0:
+            ex2.button('清单为空，暂无可导出内容', disabled=True, use_container_width=True)
+        elif fmt == 'txt':
+            ex2.download_button(
+                f'导出货物清单（{n_valid} 类 · txt）', icon=':material/download:',
+                data=build_cargo_txt(container_mm, st.session_state.rows, st.session_state.get('ship_no', '')),
+                file_name='货物清单.txt', mime='text/plain', use_container_width=True)
+        else:
+            ex2.download_button(
+                f'导出货物清单（{n_valid} 类 · xlsx）', icon=':material/download:',
+                data=build_cargo_xlsx(container_mm, st.session_state.rows, st.session_state.get('ship_no', '')),
+                file_name='货物清单.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                use_container_width=True)
+
+    with st.sidebar:
+        section_title(IC_GAUGE, '计算参数')
+        if manual:
+            st.info('手动模式：底层优先由货物清单中的「优先级」决定'
+                    '（数值越大越靠底层，仍允许叠放）。')
+            bottom_metric = 'manual'
+        else:
+            st.markdown('**底层优先指标**（重 / 密度大的货物优先放底层，仍允许叠放）')
+            use_weight = st.toggle('按重量优先（重的在下）', key='m_weight', on_change=_excl_weight)
+            use_vol = st.toggle('按体积重 / 密度优先（密度大的在下）', key='m_vol', on_change=_excl_vol)
+            bottom_metric = 'weight' if use_weight else ('volumetric' if use_vol else 'none')
+            if bottom_metric == 'none':
+                st.caption('两项均未启用：优先最大化空间利用率，同体积下再比较装入件数（不指定底层优先）。')
+        threshold = st.number_input('重货预警阈值 (kg)：仅用于上方「实时预估」提示', value=100.0, step=10.0)
+        mode_label = st.radio('计算模式', ['标准版（快速稳定）', '增强版（搜索逼近最优）'])
+        mode = 'enhanced' if mode_label.startswith('增强') else 'standard'
+        budget = 600.0
+        if mode == 'enhanced':
+            budget = st.slider('增强版搜索时间上限（秒）', 10, 600, 600, step=10)
+        go_btn = st.button('开始计算', use_container_width=True, type='primary')
+
+        st.divider()
+        st.markdown('**查看已保存方案**')
+        if st.session_state.pop('_plan_import_success', False):
+            st.success('方案已载入，集装箱尺寸、货物清单和装箱结果均已恢复。')
+        plan_file = st.file_uploader('导入方案 JSON 或 XLSX', type=['json', 'xlsx'],
+                                     label_visibility='collapsed')
+        if st.button('载入方案查看', icon=':material/folder_open:', use_container_width=True):
+            if plan_file is not None:
+                try:
+                    pk, imported_ship_no = load_saved_plan(plan_file.name, plan_file.getvalue())
+                    st.session_state._pending_plan_form = saved_plan_form_data(
+                        pk, imported_ship_no)
+                    used = sum(l * w * h for _, _, _, l, w, h in pk.packing_plan)
+                    st.session_state.result = {
+                        'packer': pk, 'fits': len(pk.packing_plan) == pk.total_units, 'msg': '',
+                        'mode': 'imported',
+                        'stats': {'placed': len(pk.packing_plan), 'total': pk.total_units,
+                                  'utilization': used / pk.container_volume if pk.container_volume else 0.0,
+                                  'evaluations': '', 'seconds': '', 'optimal_full': True}}
+                    st.session_state._plan_import_success = True
+                    st.rerun()
+                except Exception as e:  # noqa
+                    st.error(f'方案文件无法解析：{e}')
+            else:
+                st.warning('请先选择 JSON 或 XLSX 方案文件。')
+
+    # ---- 实时预估与预警（随表格即时更新，无需点击计算）----
+    boxes, no_flip, priority, descriptions = rows_to_boxes_ex(st.session_state.rows)
+    with st.container(border=True):
+        render_live_estimate(container_mm, boxes, threshold)
+
+    # ---- 触发计算：结果存入会话状态，便于之后调滑块/筛选时保留结果 ----
+    if go_btn:
+        if min(container_mm) <= 0:
+            st.warning('请填写有效的集装箱尺寸（长/宽/高均需大于 0）。')
+        elif not boxes:
+            st.warning('货物清单为空或没有有效行，请至少填写一行有效货物。')
+        else:
+            loader = st.empty()
+            loader.markdown(LOADING_HTML, unsafe_allow_html=True)  # 计算期间的动画
+            try:
+                packer, fits, msg, stats = run_packing(
+                    container_mm, boxes, threshold, mode, budget,
+                    no_flip=no_flip, priority=priority, bottom_metric=bottom_metric,
+                    descriptions=descriptions)
+                # 需求5：约束导致装不满时，对照无约束原始方案并提示代价
+                note = None
+                if not fits and (any(no_flip) or bottom_metric != 'none'):
+                    note = baseline_note(container_mm, boxes, threshold, stats['placed'])
+            finally:
+                loader.empty()
+            st.session_state.result = {'packer': packer, 'fits': fits, 'msg': msg,
+                                       'stats': stats, 'mode': mode, 'note': note}
+
+    res = st.session_state.get('result')
+    if not res:
+        st.info('填好集装箱尺寸与货物清单后，点击左侧「开始计算」。首次使用可展开顶部「使用说明」。',
+                icon=':material/lightbulb:')
+        render_footer()
+        return
+
+    packer, fits, msg, stats, mode = res['packer'], res['fits'], res['msg'], res['stats'], res['mode']
+
+    st.divider()
+    with st.container(border=True):
+        section_title(IC_CHART, '装箱结果概览')
+        _sn = st.session_state.get('ship_no', '')
+        if _sn:
+            st.caption(f'发货单号：{_sn}')
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric('装入 / 总数', f"{stats['placed']} / {stats['total']}")
+        c2.metric('空间利用率', f"{stats['utilization']*100:.1f}%")
+        c3.metric('是否全部装入', '是' if fits else '否')
+        if mode == 'enhanced':
+            c4.metric('搜索评估 / 用时', f"{stats['evaluations']} 次 / {stats['seconds']}s")
+        if not fits:
+            st.warning(f'未能全部装入：{msg}')
+        note = res.get('note')
+        if note:
+            st.info(note)
+
+    with st.container(border=True):
+        section_title(IC_CUBE, '交互式 3D 装箱结果')
+        all_cats = sorted({info['input_order'] + 1 for info in packer.box_colors})
+        cat_label = {}
+        for info in packer.box_colors:
+            cat = info['input_order'] + 1
+            if cat not in cat_label:
+                tl = TYPE_LABELS.get(str(info['type']), str(info['type']))
+                desc = str(info.get('desc', '')).strip()
+                # 高亮按钮优先显示零件描述，没有描述才回退到「类别N·类型」
+                cat_label[cat] = desc if desc else f"类别{cat}·{tl}"
+        st.session_state.setdefault('hl', set(all_cats))
+        st.session_state.hl = {c for c in st.session_state.hl if c in all_cats}
+        st.caption('点击下方按钮切换高亮（蓝色=显示中），也可直接点图例显示/隐藏。')
+        tcols = st.columns(len(all_cats) + 2)
+        for i, cat in enumerate(all_cats):
+            active = cat in st.session_state.hl
+            if tcols[i].button(cat_label[cat], key=f'hl_{cat}',
+                               type='primary' if active else 'secondary', use_container_width=True):
+                if active:
+                    st.session_state.hl.discard(cat)
+                else:
+                    st.session_state.hl.add(cat)
+                st.rerun()
+        if tcols[len(all_cats)].button('全选', use_container_width=True):
+            st.session_state.hl = set(all_cats)
+            st.rerun()
+        if tcols[len(all_cats) + 1].button('全不选', use_container_width=True):
+            st.session_state.hl = set()
+            st.rerun()
+        L_m = packer.container[0] / MM
+        W_m = packer.container[1] / MM
+        H_m = packer.container[2] / MM
+        st.caption('分段查看：每个方向都可拖动**两端滑块**圈定要显示的区段。实际装柜通常沿'
+                   '**长度方向**从一端装到另一端，拖动「长度方向」的左端或右端，即可模拟'
+                   '从前往后 / 从后往前的装载过程。')
+        r1a, r1b = st.columns(2)
+        xr = r1a.slider(f'长度方向 Length（装货方向）  0 ~ {L_m:g} m',
+                        0.0, float(L_m), (0.0, float(L_m)),
+                        step=max(0.01, round(L_m / 100, 2)), key='rng_x')
+        yr = r1b.slider(f'宽度方向 Width  0 ~ {W_m:g} m',
+                        0.0, float(W_m), (0.0, float(W_m)),
+                        step=max(0.01, round(W_m / 100, 2)), key='rng_y')
+        r2a, r2b = st.columns(2)
+        zr = r2a.slider(f'高度方向 Height  0 ~ {H_m:g} m',
+                        0.0, float(H_m), (0.0, float(H_m)),
+                        step=max(0.01, round(H_m / 100, 2)), key='rng_z')
+        r2b.markdown('<div style="height:30px"></div>', unsafe_allow_html=True)  # 与滑块对齐
+        if r2b.button('重置显示范围', icon=':material/restart_alt:', use_container_width=True):
+            for _k in ('rng_x', 'rng_y', 'rng_z'):
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+        v1, v2 = st.columns(2)
+        translucent = v1.toggle('半透明模式（可看到内部货物）', value=True, key='view_translucent')
+        show_edges = v2.toggle('显示箱体边框（便于区分相邻同色货物）', value=True, key='view_edges')
+
+        region = (to_mm(xr[0]), to_mm(xr[1]), to_mm(yr[0]), to_mm(yr[1]), to_mm(zr[0]), to_mm(zr[1]))
+        st.plotly_chart(
+            build_figure(packer, set(st.session_state.hl), region=region,
+                         translucent=translucent, show_edges=show_edges),
+            use_container_width=True, config={'displaylogo': False})
+
+    with st.container(border=True):
+        section_title(IC_LIST, '装箱清单')
+        st.dataframe(build_dataframe(packer), use_container_width=True, height=320)
+        d1, d2 = st.columns(2)
+        _sn = st.session_state.get('ship_no', '')
+        d1.download_button('下载 Excel 装箱清单', icon=':material/table_view:',
+                           data=build_excel_bytes(packer, stats, _sn),
+                           file_name='packing_plan.xlsx',
+                           mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                           use_container_width=True)
+        d2.download_button('下载 JSON 方案', icon=':material/data_object:',
+                           data=build_json_bytes(packer, _sn),
+                           file_name='packing_plan.json', mime='application/json',
+                           use_container_width=True)
+
+    render_footer()
+
+
+if __name__ == '__main__':
+    main()

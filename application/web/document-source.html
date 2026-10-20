@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Word / PDF 原文核对</title>
+  <link rel="stylesheet" href="css/document-source.css">
+</head>
+<body>
+  <header>
+    <div><strong id="file-name">原文核对</strong><p id="focus-note">正在生成原版式预览…</p></div>
+    <nav aria-label="文档工具">
+      <label>页码 <select id="page-select" disabled></select></label>
+      <label>缩放 <select id="zoom"><option value="fit">适合窗口</option><option value="1">100%</option><option value="1.5">150%</option></select></label>
+      <a id="download" hidden>下载导入原件</a>
+      <a id="pdf" target="_blank" rel="noopener" hidden>打开 PDF 预览</a>
+    </nav>
+  </header>
+  <p id="status" role="status">正在读取文档。Word 首次预览需要本机排版引擎，可能需要稍等。</p>
+  <main id="pages" aria-label="原文页面"></main>
+  <script type="module" src="js/document-source.js"></script>
+</body>
+</html>

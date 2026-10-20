@@ -1,0 +1,45 @@
+# Local business documents, saved templates and historical artifacts
+/真实数据/
+/测试数据/
+/测试记录/
+/发布包/
+/ContainerPlanner-网页版/
+/application/data/
+
+# Dependencies and generated files
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+web_env/
+build_env/
+node_modules/
+build/
+dist/
+_internal/
+*.exe
+*.dll
+*.log
+*-pid.txt
+/packaging/last-backup.txt
+/packaging/release-verification.json
+
+# Local configuration, credentials and browser profiles
+.env
+.env.*
+!.env.example
+secrets.toml
+*.pem
+*.key
+.cdp-*/
+.cache/
+.pytest_cache/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Reports derived from local business documents
+/features/trade-documents/tests/*audit.json
+/features/trade-documents/tests/*verification.md

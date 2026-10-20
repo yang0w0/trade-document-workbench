@@ -1,0 +1,29 @@
+:root { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: #20252d; background: #f4f6f9; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 680px; height: 100vh; display: flex; flex-direction: column; }
+.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 12px 18px; background: #fff; border-bottom: 1px solid #dce1e8; }
+.title-block { display: grid; gap: 4px; min-width: 0; }
+.title-block strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.title-block span, footer { color: #687386; font-size: 12px; }
+.tools { display: flex; align-items: center; gap: 9px; white-space: nowrap; }
+.tools label { color: #687386; font-size: 12px; }
+select, button { min-height: 34px; padding: 6px 11px; border: 1px solid #ccd3df; border-radius: 7px; background: white; color: #293246; font: inherit; font-size: 12px; }
+button { border-color: #335bd6; background: #335bd6; color: white; cursor: pointer; font-weight: 600; }
+button:disabled, select:disabled { opacity: .55; cursor: not-allowed; }
+.sheet-wrap { flex: 1; overflow: auto; background: #fff; }
+.focus-row td { box-shadow: inset 0 2px #e6a100, inset 0 -2px #e6a100; }
+.tools a { color: #335bd6; font-size: 12px; text-decoration: none; }
+table { border-collapse: separate; border-spacing: 0; min-width: 100%; table-layout: fixed; }
+col { width: 64px; }
+th, td { min-width: 0; max-width: 600px; height: 20px; padding: 3px 5px; border-right: 1px solid #e3e7ed; border-bottom: 1px solid #e3e7ed; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+thead th, .row-head, .corner { position: sticky; z-index: 2; background: #f3f5f8; color: #5f6b7b; text-align: center; font-weight: 500; }
+thead th { top: 0; }
+.row-head { left: 0; width: 52px; min-width: 52px; max-width: 52px; }
+.corner { left: 0; top: 0; z-index: 3; width: 52px; min-width: 52px; }
+td { background: #fff; outline: none; }
+td:focus { position: relative; z-index: 1; box-shadow: inset 0 0 0 2px #4569dc; }
+td.edited { background: #fff7d6; }
+td.focus-cell { box-shadow: inset 0 0 0 2px #e28c2c; background: #fff9ed; }
+.empty { padding: 35px; color: #687386; text-align: center; }
+footer { min-height: 34px; padding: 9px 16px; border-top: 1px solid #dce1e8; background: #fff; }
+@media (max-width: 760px) { body { min-width: 0; } .toolbar { align-items: flex-start; flex-direction: column; gap: 10px; } .tools { flex-wrap: wrap; } }

@@ -1,0 +1,35 @@
+# 服务器上已有 Caddy / nginx 等网关容器占用 80/443 时使用：只启动装箱网站，
+# 加入网关所在的 Docker 网络，由已有网关按子域名转发到 local-workbench:8000。
+#
+# 用法（在仓库根目录）：
+#   GATEWAY_NETWORK=<网关容器所在的网络名> docker compose -f docker-compose.shared.yml up -d --build
+# 也可以把 GATEWAY_NETWORK 等变量写进 .env。
+services:
+  loader:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    image: local-workbench:latest
+    container_name: local-workbench
+    restart: unless-stopped
+    environment:
+      LOADER_TEMPLATE_FILE: /app/data/templates.json
+      # 小内存、两核且与其他系统共用的服务器：同时只算一个任务
+      LOADER_MAX_RUNNING: ${LOADER_MAX_RUNNING:-1}
+      LOADER_MAX_BUDGET: ${LOADER_MAX_BUDGET:-600}
+    # 资源上限：计算再重也不会挤占同机其他服务
+    mem_limit: ${LOADER_MEM_LIMIT:-400m}
+    cpus: ${LOADER_CPUS:-1.0}
+    volumes:
+      - loader_data:/app/data
+    networks:
+      - gateway
+
+volumes:
+  loader_data:
+
+networks:
+  gateway:
+    external: true
+    name: ${GATEWAY_NETWORK:?请设置 GATEWAY_NETWORK 为网关容器所在的 Docker 网络名}

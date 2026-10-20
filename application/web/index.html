@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地业务工作台</title>
+  <meta name="description" content="面向真实装柜约束的三维装箱系统：把货物清单转化为可执行、可复核、可导出的装载方案。">
+  <meta name="theme-color" content="#0C1524">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/app.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <div class="page-grid" aria-hidden="true">
+    <div class="ambient-halo halo-a"></div>
+    <div class="ambient-halo halo-b"></div>
+    <div class="ambient-halo halo-c"></div>
+    <svg class="route-field" viewBox="0 0 1600 1200" preserveAspectRatio="none">
+      <path class="route" d="M-80 210C270 70 430 360 760 224S1260 88 1680 242"/>
+      <path class="route route-b" d="M-120 880C260 680 510 980 860 790s540-92 860 12"/>
+      <circle class="node" cx="410" cy="268" r="4"/>
+      <circle class="node" cx="1010" cy="170" r="4"/>
+      <circle class="node" cx="1180" cy="710" r="4"/>
+    </svg>
+  </div>
+
+  <nav class="module-nav" aria-label="功能区">
+    <div class="module-nav-inner">
+      <button class="module-nav-item active" type="button" data-module-tab="container" aria-current="page">
+        <span>集装箱装箱</span><small>货物规划与三维复核</small>
+      </button>
+      <button class="module-nav-item" type="button" data-module-tab="documents">
+        <span>贸易单据</span><small>导入、提取与核对</small>
+      </button>
+    </div>
+  </nav>
+
+  <div class="shell" id="container-shell">
+    <header class="hero">
+      <div class="hero-copy">
+        <div class="hero-kicker">LOCAL BUSINESS WORKSPACE</div>
+        <h1 class="hero-title">让每一立方米，<br><span>都有明确去处。</span></h1>
+        <p class="hero-sub">面向真实装柜约束的三维装箱系统。以整数几何内核校验边界、碰撞与支撑，
+          结合混合启发式搜索生成可执行、可复核、可导出的装载方案。</p>
+        <div class="hero-meta">
+          <div class="hero-meta-item"><strong>智能排样</strong>多策略探索</div>
+          <div class="hero-meta-item"><strong>三维复核</strong>空间关系可视</div>
+          <div class="hero-meta-item"><strong>方案交付</strong>导入导出衔接</div>
+        </div>
+      </div>
+      <div class="hero-visual">
+        <svg viewBox="0 0 500 300" fill="none" aria-hidden="true">
+          <path d="M56 82 276 28l164 74-222 58L56 82Z" stroke="#5F7190" stroke-width="1.2"/>
+          <path d="M56 82v126l162 70V160M218 160v118l222-62V102" stroke="#5F7190" stroke-width="1.2"/>
+          <path d="m79 112 126 54v82L79 194v-82Z" fill="#1B2A42" stroke="#4567D8"/>
+          <path d="m216 168 76-20v83l-76 20v-83Z" fill="#2347D9" fill-opacity=".7" stroke="#6E87E8"/>
+          <path d="m298 146 70-18v82l-70 19v-83Z" fill="#18263C" stroke="#63738C"/>
+          <path d="m373 126 47-12v82l-47 13v-83Z" fill="#21304A" stroke="#63738C"/>
+          <path d="m80 107 126-31 86 36-128 33-84-38Z" fill="#22314B" stroke="#63738C"/>
+          <path d="m211 75 67-16 87 37-68 17-86-38Z" fill="#3151CB" fill-opacity=".65" stroke="#7890E7"/>
+          <path d="m283 58 55-13 87 37-56 14-86-38Z" fill="#1A2940" stroke="#63738C"/>
+          <path d="M56 228h384" stroke="#324158" stroke-dasharray="4 5"/>
+          <path d="M56 238h384" stroke="#253348" stroke-dasharray="2 7"/>
+        </svg>
+        <div class="hero-flow"><span>cargo list</span><i></i><span>smart planning</span><i></i><span>loading plan</span></div>
+      </div>
+    </header>
+
+<div class="layout">
+      <!-- ============ 侧栏：计算参数 / 已保存方案 ============ -->
+      <aside class="side" aria-label="计算参数">
+<section class="side-block">
+          <h2 class="sec-title"><span class="sec-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 14a8 8 0 0 1 16 0"/><path d="M12 14l3.5-2.5"/></svg></span>计算参数</h2>
+          <div id="metric-auto">
+            <p class="label-strong">底层优先指标</p>
+            <p class="caption tight">重 / 密度大的货物优先放底层，仍允许叠放</p>
+            <label class="switch"><input type="checkbox" id="m-weight"><span class="track" aria-hidden="true"></span><span>按重量优先（重的在下）</span></label>
+            <label class="switch"><input type="checkbox" id="m-vol"><span class="track" aria-hidden="true"></span><span>按体积重 / 密度优先（密度大的在下）</span></label>
+            <p class="caption" id="metric-none-hint">两项均未启用：优先最大化空间利用率，同体积下再比较装入件数。</p>
+          </div>
+
+          <label class="field">
+            <span>重货预警阈值 (kg)</span>
+            <input type="number" id="threshold" min="0" step="10" value="100" inputmode="decimal">
+            <small>仅用于「实时预估」提示</small>
+          </label>
+
+<button type="button" class="btn primary block" id="btn-compute">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>
+            开始计算
+          </button>
+          <p class="form-msg" id="compute-msg" role="alert"></p>
+        </section>
+
+        <section class="side-block">
+          <h3 class="side-sub">查看已保存方案</h3>
+          <label class="file-pick">
+            <input type="file" id="plan-file" accept=".json,.xlsx">
+            <span class="file-name" data-empty="选择 JSON 或 XLSX 方案文件">选择 JSON 或 XLSX 方案文件</span>
+          </label>
+          <button type="button" class="btn block" id="btn-load-plan">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
+            载入方案查看
+          </button>
+          <p class="form-msg" id="plan-msg" role="status"></p>
+        </section>
+      </aside>
+
+      <!-- ============ 输入区 ============ -->
+      <div class="inputs">
+        <section class="card">
+          <h2 class="sec-title"><span class="sec-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="M3 7l9 5 9-5"/><path d="M12 12v10"/></svg></span>集装箱尺寸（米）</h2>
+          <label class="field">
+            <span>发货单号</span>
+            <input type="text" id="ship-no" maxlength="100" placeholder="选填，例如 SO20260814001" autocomplete="off">
+          </label>
+          <p class="caption">点选常用柜型快速填入（当前选中的柜型高亮蓝底），也可直接在下方手动输入尺寸。</p>
+          <div class="presets" id="presets"></div>
+          <div class="grid3">
+            <label class="field"><span>长 Length</span><input type="number" id="c-l" min="0" step="0.01" inputmode="decimal"></label>
+            <label class="field"><span>宽 Width</span><input type="number" id="c-w" min="0" step="0.01" inputmode="decimal"></label>
+            <label class="field"><span>高 Height</span><input type="number" id="c-h" min="0" step="0.01" inputmode="decimal"></label>
+          </div>
+          <label class="field"><span>集装箱数量</span><input type="number" id="container-count" min="1" step="1" value="1"></label>
+          <div class="btn-row template-row"><input id="container-template-name" class="template-name" type="text" maxlength="100" placeholder="集装箱模板名称">
+            <button type="button" class="btn" id="btn-save-container">保存当前柜型</button><select id="container-template-select" aria-label="选择已保存柜型"><option value="">选择已保存柜型</option></select>
+            <button type="button" class="btn" id="btn-apply-container">应用</button></div>
+        </section>
+
+        <section class="card">
+          <h2 class="sec-title"><span class="sec-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1.1"/><circle cx="3.5" cy="12" r="1.1"/><circle cx="3.5" cy="18" r="1.1"/></svg></span>货物清单</h2>
+          <p class="caption" id="cargo-caption">每种商品集中在一张卡片中编辑；数量留空或填 0 = 最大装填。常用商品可保存，下次直接选择并补充数量。</p>
+          <div class="presets product-templates" id="product-templates" aria-label="已保存商品"></div>
+          <div class="cargo-cards" id="cargo-cards"></div>
+          <p class="caption empty-note" id="cargo-empty" hidden>清单为空，点击下方「添加一行」或「载入示例」开始录入。</p>
+          <div class="btn-row">
+            <button type="button" class="btn" id="btn-add-row">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>添加一行</button>
+            <button type="button" class="btn" id="btn-clear">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>清空清单</button>
+            <button type="button" class="btn" id="btn-sample">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>载入示例</button>
+          </div>
+        </section>
+
+        <details class="card fold">
+          <summary>
+            <svg class="sum-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3M7 8l5-5 5 5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></svg>
+            从文件 / 文本导入（导入后会填入上面的清单供核对）
+          </summary>
+          <label class="file-pick">
+            <input type="file" id="cargo-file" accept=".txt,.xlsx">
+            <span class="file-name" data-empty="选择 txt 或 xlsx 文件">选择 txt 或 xlsx 文件</span>
+          </label>
+          <label class="field">
+            <span>或粘贴数据文本（第一行集装箱长宽高，第二行种类数，其后每行：长 宽 高 数量 重量 类型）</span>
+            <textarea id="cargo-text" rows="5" spellcheck="false"></textarea>
+          </label>
+          <button type="button" class="btn" id="btn-import">导入到清单</button>
+          <p class="form-msg" id="import-msg" role="status"></p>
+        </details>
+
+        <details class="card fold">
+          <summary>
+            <svg class="sum-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></svg>
+            导出当前清单（保存录入进度，下次导入即可继续）
+          </summary>
+          <p class="caption">导出内容包含集装箱尺寸、发货单号与全部货物行，可用「从文件 / 文本导入」原样读回来继续编辑。</p>
+          <div class="export-row">
+            <div class="segmented small" role="radiogroup" aria-label="导出格式">
+              <label><input type="radio" name="cargo-fmt" value="txt" checked><span>txt</span></label>
+              <label><input type="radio" name="cargo-fmt" value="xlsx"><span>xlsx</span></label>
+            </div>
+            <button type="button" class="btn" id="btn-export-cargo">导出货物清单</button>
+          </div>
+        </details>
+
+        <section class="card">
+          <h2 class="sec-title"><span class="sec-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 14a8 8 0 0 1 16 0"/><path d="M12 14l3.5-2.5"/></svg></span>实时预估</h2>
+          <div class="metrics" id="estimate-metrics"></div>
+          <div class="progress" aria-hidden="true"><div class="progress-bar" id="estimate-bar"></div></div>
+          <div id="estimate-alerts"></div>
+        </section>
+      </div>
+
+      <!-- ============ 结果区 ============ -->
+      <div class="results" id="results">
+        <section class="card calc-card" id="calc-card" hidden>
+          <div class="calc-loader">
+            <div class="cubes" aria-hidden="true"><div class="cube"></div><div class="cube"></div><div class="cube"></div><div class="cube"></div><div class="cube"></div></div>
+            <div class="calc-text" id="calc-text">正在计算最优装箱方案…</div>
+            <div class="calc-sub" id="calc-sub">正在尝试多种装载策略与货物朝向，请稍候</div>
+            <div class="progress calc-progress"><div class="progress-bar" id="calc-bar"></div></div>
+            <button type="button" class="btn" id="btn-cancel">取消计算</button>
+          </div>
+        </section>
+
+        <section class="card hint-card" id="empty-hint">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.4 1 1.1 1 1.8V16h5v-.3c0-.7.4-1.4 1-1.8A6 6 0 0 0 12 3Z"/></svg>
+          <span>填好集装箱尺寸与货物清单后，点击「开始计算」。</span>
+        </section>
+
+        <div id="result-area" hidden>
+          <section class="card">
+            <h2 class="sec-title"><span class="sec-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V4M4 20h16"/><rect x="7" y="11" width="3" height="6" rx="1"/><rect x="13" y="7" width="3" height="10" rx="1"/></svg></span>装箱结果概览</h2>
+            <p class="caption" id="result-ship" hidden></p>
+            <div class="metrics" id="result-metrics"></div>
+            <div id="result-alerts"></div>
+          </section>
+
+          <section class="card">
+            <h2 class="sec-title"><span class="sec-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="M3 7l9 5 9-5"/><path d="M12 12v10"/></svg></span>交互式 3D 装箱结果</h2>
+            <p class="caption">点击图例切换该类货物高亮（实色 = 显示中）。左键旋转、右键平移、滚轮缩放；悬停查看单件详情。</p>
+            <div class="legend" id="legend"></div>
+            <div class="btn-row compact">
+              <button type="button" class="btn small" id="btn-hl-all">全选</button>
+              <button type="button" class="btn small" id="btn-hl-none">全不选</button>
+            </div>
+
+            <div class="viewer-wrap" id="viewer-wrap">
+              <div class="viewer" id="viewer"></div>
+              <div class="viewer-toolbar" role="toolbar" aria-label="视图">
+                <button type="button" data-view="iso" title="等轴测视角">等轴测</button>
+                <button type="button" data-view="top" title="从上往下看">俯视</button>
+                <button type="button" data-view="side" title="从侧面看（长 × 高）">侧视</button>
+                <button type="button" data-view="end" title="沿长度方向看（宽 × 高）">端视</button>
+                <span class="sep"></span>
+                <button type="button" id="btn-shot" title="保存当前画面为图片">截图</button>
+                <button type="button" id="btn-full" title="全屏查看">全屏</button>
+              </div>
+              <div class="viewer-info" id="viewer-info"></div>
+              <div class="viewer-tip" id="viewer-tip" hidden></div>
+              <div class="viewer-fallback" id="viewer-fallback" hidden>当前浏览器无法显示三维图（WebGL 不可用）。装箱清单与导出不受影响。</div>
+            </div>
+
+            <p class="caption">分段查看：每个方向都可拖动<strong>两端滑块</strong>圈定要显示的区段（以货物起点所在位置判断）。
+              实际装柜通常沿<strong>长度方向</strong>从一端装到另一端，拖动「长度方向」的左端或右端即可模拟装载过程。</p>
+            <div class="ranges" id="ranges"></div>
+            <div class="view-options">
+              <label class="switch"><input type="checkbox" id="opt-translucent" checked><span class="track" aria-hidden="true"></span><span>半透明模式（可看到内部货物）</span></label>
+              <label class="switch"><input type="checkbox" id="opt-edges" checked><span class="track" aria-hidden="true"></span><span>显示箱体边框（便于区分相邻同色货物）</span></label>
+              <button type="button" class="btn small" id="btn-reset-range">重置显示范围</button>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2 class="sec-title"><span class="sec-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1.1"/><circle cx="3.5" cy="12" r="1.1"/><circle cx="3.5" cy="18" r="1.1"/></svg></span>装箱清单</h2>
+            <div class="tabs" role="tablist">
+              <button type="button" role="tab" aria-selected="true" data-tab="summary">分类汇总</button>
+              <button type="button" role="tab" aria-selected="false" data-tab="detail">装箱明细</button>
+            </div>
+            <div class="table-wrap scroll" id="tab-summary"><table class="data-table" id="summary-table"></table></div>
+            <div class="table-wrap scroll" id="tab-detail" hidden><table class="data-table" id="detail-table"></table></div>
+            <div class="btn-row two">
+              <button type="button" class="btn" id="btn-dl-xlsx">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 4v16"/></svg>下载 Excel 装箱清单</button>
+              <button type="button" class="btn" id="btn-dl-json">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4H7a2 2 0 0 0-2 2v4l-2 2 2 2v4a2 2 0 0 0 2 2h1M16 4h1a2 2 0 0 1 2 2v4l2 2-2 2v4a2 2 0 0 1-2 2h-1"/></svg>下载 JSON 方案</button>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <div class="footer-brand">
+          <span class="sig-mark">本地</span>
+          <div>
+            <div class="footer-name">集装箱装箱工作台</div>
+            <div class="footer-sub">本地运行 · 集装箱与贸易单据</div>
+          </div>
+        </div>
+        <div class="footer-version">Constraint-aware · Geometry verified</div>
+      </div>
+    </footer>
+  </div>
+
+  <div class="shell documents-shell" id="documents-shell" hidden>
+    <header class="documents-hero">
+      <div>
+        <h1>贸易单据处理</h1>
+        <p>导入合同、PI、报关及检验资料，自动归并重复字段并列出来源供你核对；也可以直接手工填写。</p>
+      </div>
+      <button class="btn document-overall-launcher" id="td-open-overall-templates" type="button" aria-haspopup="dialog" aria-controls="td-overall-template-dialog">总体模板</button>
+      <div class="documents-hero-mark" aria-hidden="true">
+        <svg viewBox="0 0 64 64" fill="none"><path d="M18 8h20l12 12v36H18z" stroke="currentColor" stroke-width="2"/><path d="M38 8v13h12M25 32h18M25 40h18M25 48h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </div>
+    </header>
+
+    <button class="btn document-import-launcher" id="td-open-import" type="button" aria-haspopup="dialog" aria-controls="td-import-dialog" title="点击导入单据；拖动可移动，位置自动保存"><span aria-hidden="true">↑</span>导入单据<small id="td-file-count">0 个文件</small><small>拖动可移动</small></button>
+    <main class="documents-layout">
+      <dialog class="document-template-dialog" id="td-overall-template-dialog" aria-labelledby="td-overall-template-title">
+        <div class="document-section-head">
+          <h3 id="td-overall-template-title">总体模板</h3>
+          <button class="btn" id="td-close-overall-templates" type="button" aria-label="关闭总体模板">×</button>
+        </div>
+        <p class="caption">保存所有栏目和产品的填写内容；套用前会提示确认。</p>
+        <div id="td-overall-templates"></div>
+      </dialog>
+      <dialog class="document-import-dialog" id="td-import-dialog" aria-labelledby="td-import-title">
+      <section class="document-import-card">
+        <div class="document-section-head">
+          <div><h2 id="td-import-title">导入单据</h2><p class="caption">所有文件使用同一套识别规则；内容在本机解析，不会上传到云端。</p></div>
+          <button class="btn document-dialog-close" id="td-close-import" type="button" aria-label="关闭导入窗口">×</button>
+        </div>
+        <label class="document-drop" id="td-drop-zone" for="td-file-input">
+          <input type="file" id="td-file-input" accept=".pdf,.doc,.docx,.xlsx,.xls,.txt,.csv,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp" multiple>
+          <span class="document-upload-icon" aria-hidden="true">↑</span>
+          <strong>选择文件或拖放到这里，继续添加</strong>
+          <small>PDF、Word、Excel、图片和文本文件，单个文件最大 25 MB</small>
+        </label>
+        <div class="document-file-list" id="td-file-list" aria-live="polite">
+          <p class="td-empty">尚未选择文件</p>
+        </div>
+        <label class="document-review-option"><input type="checkbox" id="td-skip-candidate-review">本次识别自动跳过多候选项确认，稍后在页面核对</label>
+        <div class="btn-row two document-actions">
+          <button class="btn primary" type="button" id="td-extract-btn" disabled>识别所选文件</button>
+          <button class="btn" type="button" id="td-clear-files-btn">清空文件</button>
+          <button class="btn" type="button" id="td-clear-files-and-fields-btn">清空文件和字段</button>
+        </div>
+        <p class="form-msg" id="td-import-status" role="status"></p>
+        <div class="document-ocr-note"><strong>扫描件 OCR</strong><span>扫描 PDF 和图片使用本机中英文 OCR；识别不确定的字段会标出来源，供你复核。</span></div>
+      </section>
+      </dialog>
+
+      <section class="card document-fields-card" aria-labelledby="td-fields-title">
+        <div class="document-section-head">
+          <div><h2 id="td-fields-title">字段汇总与手工录入</h2><p class="caption">产品按独立卡片录入，可逐项添加或删除；净重等重量信息统一填写在“包装”中。</p></div>
+          <div class="document-fields-toolbar" aria-label="字段汇总操作">
+            <button class="btn" type="button" id="td-review-candidates" disabled aria-haspopup="dialog">核对候选项</button>
+            <button class="btn" type="button" id="td-export-fields-btn">导出字段 Excel 表格</button>
+            <label class="btn" for="td-import-fields-input">导入并恢复字段</label>
+            <input type="file" id="td-import-fields-input" accept=".xlsx" hidden>
+            <button class="btn" type="button" id="td-restore-btn">恢复上次填写</button>
+          </div>
+        </div>
+        <div class="document-source-summary" id="td-source-summary"><span>0 个文件</span><span>等待导入或手工填写</span></div>
+        <div class="presets document-group-tiles" id="td-group-tiles" aria-label="单据字段分类"></div>
+        <div id="td-field-groups"></div>
+        <details class="document-unmatched" id="td-unmatched-wrap" hidden>
+          <summary>查看未匹配到字段的原文</summary>
+          <div id="td-unmatched-text"></div>
+        </details>
+        <div class="btn-row document-save-actions">
+          <button class="btn primary" type="button" id="td-save-btn">保存本次核对</button>
+          <button class="btn" type="button" id="td-reset-btn">清空文件和字段</button>
+          <span class="document-save-state" id="td-save-state" role="status"></span>
+        </div>
+        <p class="caption">填写内容会自动保存到当前浏览器本机；重新打开时默认保持空白，点击“恢复上次填写”才会载入已保存内容。导出的 Excel 按字段类别分表，产品表按产品逐项列出；导入会按字段标识或名称匹配，也兼容旧版“货物”表。恢复上次填写不会恢复源文件，请重新选择文件以查看来源证据。</p>
+        <div class="documents-bottom-space" id="documents-bottom-space" aria-hidden="true"></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog class="document-drop-confirm" id="td-drop-confirm" aria-labelledby="td-drop-confirm-title">
+    <h3 id="td-drop-confirm-title">是否导入这些文件？</h3>
+    <p>确认后可在导入窗口中继续添加或移除文件，再开始识别。</p>
+    <ul id="td-dropped-files"></ul>
+    <div class="btn-row two">
+      <button class="btn primary" id="td-confirm-drop" type="button">导入文件</button>
+      <button class="btn" id="td-cancel-drop" type="button">取消</button>
+    </div>
+  </dialog>
+  <div class="document-page-drop" id="td-page-drop" hidden aria-hidden="true"><strong>松开文件以导入单据</strong><span>确认后可增删文件，再开始识别</span></div>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h3 id="confirm-title">删除确认</h3>
+      <p id="confirm-text">确定要删除这一行货物吗？删除后不可恢复。</p>
+      <label class="check" id="confirm-skip-wrap"><input type="checkbox" id="confirm-skip"> 本次使用不再提示删除确认</label>
+      <div class="btn-row two">
+        <button type="submit" class="btn primary" value="ok" id="confirm-ok">确认删除</button>
+        <button type="submit" class="btn" value="cancel">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <script type="module" src="js/trade-documents.js"></script>
+</body>
+</html>

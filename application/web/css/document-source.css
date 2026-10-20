@@ -1,0 +1,15 @@
+* { box-sizing: border-box; }
+body { margin: 0; color: #253349; background: #e8ecf1; font: 14px/1.5 "Segoe UI", "Microsoft YaHei", sans-serif; }
+header { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; padding: 14px 24px; background: white; border-bottom: 1px solid #ccd5e0; }
+header strong { font-size: 18px; overflow-wrap: anywhere; }
+header p { margin: 4px 0 0; }
+nav { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; }
+select, a { padding: 7px; border-radius: 4px; }
+a { color: #155cc0; }
+#status { margin: 12px 24px; }
+#pages { padding: 8px 24px 40px; overflow: auto; }
+.page { position: relative; margin: 0 auto 24px; background: white; box-shadow: 0 2px 8px #27384b30; scroll-margin-top: 145px; }
+.page img { display: block; width: 100%; height: 100%; }
+.highlight { position: absolute; background: #ffd92d55; outline: 2px solid #ef9b14; pointer-events: none; }
+.page-caption { padding: 3px 8px; background: #fff; text-align: center; }
+@media (max-width: 640px) { header { padding: 12px; } #pages { padding: 8px 8px 32px; } }
